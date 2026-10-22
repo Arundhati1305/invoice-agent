@@ -37,7 +37,7 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openai/v1").rs
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 LLM_MOCK = os.environ.get("LLM_MOCK", "") == "1"
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "4"))     # packages per parallel LLM call
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "12"))    # items per LLM call (paragraphs are short)
 REF_FORMAT = os.environ.get("REF_FORMAT", "inner")       # "inner" -> ABC-1, "bracketed" -> [ABC-1]
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DECIDE_BUDGET_S = float(os.environ.get("DECIDE_BUDGET_S", "38"))
@@ -204,31 +204,30 @@ NOT_FOUND = lambda: err(404, "TASK_NOT_FOUND", "Task not found")
 
 # ----------------------------------------------------------------------------
 # Decision layer
+#   1. Code finds the decisive paragraph (exactly three bracketed refs) and reads
+#      facts from the signed cover sheet.
+#   2. One small batched LLM call classifies each decisive paragraph.
+#   3. Rule-based backstop (incl. exact authority arithmetic) guards the result
+#      and takes over if the model is unavailable.
+#   Packages whose layout is unexpected fall back to a full-document LLM read.
 # ----------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are an accounts-payable control agent. For every invoice package choose exactly ONE action:
+SYSTEM_PROMPT = """You are an accounts-payable control agent. For each item, read the DECISIVE PARAGRAPH (the binding, current statement about this invoice) and choose exactly ONE action:
 
-- settle_invoice: invoice is valid, reconciled (PO/receipt/invoice agree), not already paid, no pending verification, AND the amount is within the agent's autonomous/delegated authority.
-- request_approval: commercially valid, but the amount or nature is OUTSIDE the agent's delegated authority, so a named approver must approve first.
-- hold_invoice: payment must pause until a stated verification completes (e.g. bank-detail change callback, tax/registration check, goods inspection pending).
-- reject_duplicate: the SAME commercial invoice (same vendor + same invoice number/commercial substance) was ALREADY PAID. A payment for a DIFFERENT invoice is NOT a duplicate.
-- open_exception: material records conflict (quantities, prices, amounts, vendor identity, PO vs invoice) and need an exception workflow.
+- settle_invoice: valid, reconciled, not already paid, nothing pending, and the amount is WITHIN autonomous/delegated authority. A prior payment for a DIFFERENT invoice does not block settlement.
+- request_approval: commercially valid but OUTSIDE delegated authority (amount above the limit, or a named approver / approval workflow is required).
+- hold_invoice: payment must pause until a stated verification completes (e.g. bank-detail change callback still open, an inspection or check pending).
+- reject_duplicate: the SAME commercial invoice was already paid (formatting differences in the identifier do not matter).
+- open_exception: material records conflict (price/quantity/valuation/contract disagreements) and need the exception workflow.
 
-How to read a package:
-- Several documents mix useful facts with noise. Exactly ONE paragraph is decisive: the current, binding statement about THIS invoice under the CURRENT policy revision that determines the action. That paragraph contains exactly three bracketed references like [XYZ-123].
-- IGNORE: the cover-sheet reference, archived/historical/"for example" cases, training material and decoys, superseded policy revisions, NEGATED statements ("not a duplicate", "no hold is required", "does not exceed"), and action words used in irrelevant contexts.
-- Never settle when anything requires approval, a hold, a duplicate rejection, or an exception. If in doubt, do NOT settle.
+Watch for negation ("No ... discrepancy remains", "not a duplicate") and for amounts: compare the stated total with any authority limit.
+If an item has "documents" instead of a decisive paragraph, find the decisive paragraph yourself: it is the current statement about this invoice with exactly three bracketed references; ignore the cover sheet, archive notes, training material, hypothetical examples and superseded drafts. Then also return its three references (text inside the brackets) and the invoice facts.
 
-Facts (from the CURRENT invoice itself):
-- vendorName and invoiceNumber exactly as written on the invoice.
-- amountMinor: integer amount in minor units (INR 1,234.50 -> 123450; JPY has no minor unit).
-- currency: ISO 4217 code, e.g. "INR".
+Return ONLY JSON:
+{"decisions":[{"packageId":"...","action":"<one action>","reason":"one short sentence",
+ "evidenceRefs":["only for document items"],"facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"}}]}"""
 
-Return ONLY a JSON object:
-{"decisions":[{"packageId":"...","action":"<one action>","decisiveParagraph":"<first 15 words of the decisive paragraph>",
-"evidenceRefs":["REF1","REF2","REF3"],
-"facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},
-"rationale":"2-4 sentences naming the action and citing the references in square brackets"}]}
-evidenceRefs: the three references copied EXACTLY from the decisive paragraph, text inside the brackets only."""
+FACTS_RE = re.compile(r"Supplier\s+(.+?);\s*invoice\s+([^;\s]+);\s*stated total\s+([A-Z]{3})\s*([\d,]+(?:\.\d+)?)", re.I)
+NOISE_RE = re.compile(r"archive note|training appendix|hypothetical|for example|superseded|non-operative", re.I)
 
 
 def strip_ids(pkg):
@@ -246,7 +245,7 @@ def paragraphs_of(obj):
         if isinstance(x, str):
             for para in re.split(r"\n\s*\n", x):
                 if para.strip():
-                    out.append(para)
+                    out.append(para.strip())
         elif isinstance(x, dict):
             for v in x.values():
                 walk(v)
@@ -257,16 +256,21 @@ def paragraphs_of(obj):
     return out
 
 
+def refs_in(text):
+    out = []
+    for m in REF_RE.finditer(text):
+        r = m.group(1).strip()
+        if r not in out:
+            out.append(r)
+    return out
+
+
 def ref_index(pkg):
-    """Map each bracketed ref -> set of paragraph indices; and paragraph -> ordered refs."""
     paras = paragraphs_of(strip_ids(pkg))
     ref_paras, para_refs = {}, []
     for i, p in enumerate(paras):
-        refs = []
-        for m in REF_RE.finditer(p):
-            r = m.group(1).strip()
-            if r not in refs:
-                refs.append(r)
+        refs = refs_in(p)
+        for r in refs:
             ref_paras.setdefault(r, set()).add(i)
         para_refs.append(refs)
     return ref_paras, para_refs
@@ -288,47 +292,81 @@ def to_int_minor(v):
     raise ValueError
 
 
+def money_minor(txt):
+    from decimal import Decimal
+    return int((Decimal(txt.replace(",", "")) * 100).to_integral_value())
+
+
 def fmt_ref(r):
     return f"[{r}]" if REF_FORMAT == "bracketed" else r
 
 
-def build_rationale(action, refs, model_text):
+def analyze(pkg):
+    """Deterministic read: facts from the cover sheet and the decisive paragraph."""
+    paras = paragraphs_of(strip_ids(pkg))
+    facts = None
+    for p in paras:
+        m = FACTS_RE.search(p)
+        if m:
+            facts = {"vendorName": m.group(1).strip(), "invoiceNumber": m.group(2).strip(),
+                     "amountMinor": money_minor(m.group(4)), "currency": m.group(3).upper()}
+            break
+    cands = [p for p in paras if len(refs_in(p)) == 3 and not FACTS_RE.search(p)]
+    if len(cands) > 1:
+        cands = [p for p in cands if not NOISE_RE.search(p)] or cands
+    para = cands[0] if len(cands) == 1 else None
+    return {"facts": facts, "paragraph": para, "refs": refs_in(para) if para else None}
+
+
+def rule_action(para, facts):
+    """Keyword/arithmetic classifier. Returns an action or None when unsure."""
+    t = para.lower()
+    if re.search(r"different (signed )?commercial invoice|not a duplicate|no payment was made for this", t) \
+            and not re.search(r"would be a duplicate|reject it", t):
+        return "settle_invoice"
+    if re.search(r"would be a duplicate|reject it|prior payment for the same (signed )?commercial invoice|already (been )?paid", t):
+        return "reject_duplicate"
+    if re.search(r"callback|until .{0,60}(clos|complet|confirm|verif|clear)|forbids remittance|pending verification|verification (is )?pending", t):
+        return "hold_invoice"
+    if re.search(r"exception workflow|does not reconcile|incompatible|conflicting records|irreconcil", t):
+        return "open_exception"
+    if re.search(r"authority|approver|approval workflow|without escalation|delegat", t):
+        limit = None
+        m = re.search(r"(?:up to|limit of|authority of)\s*([A-Z]{3})?\s*([\d,]+(?:\.\d+)?)", para) or \
+            re.search(r"([A-Z]{3})\s*([\d,]+(?:\.\d+)?)\s*authority", para)
+        if m:
+            limit = money_minor(m.group(2))
+        if facts and limit is not None:
+            return "request_approval" if facts["amountMinor"] > limit else "settle_invoice"
+        if re.search(r"outside|exceed|above|larger|requires the financial-approval|named approver", t):
+            return "request_approval"
+        if re.search(r"within", t):
+            return "settle_invoice"
+    return None
+
+
+def build_rationale(action, refs, extra):
     cites = ", ".join(f"[{r}]" for r in refs)
-    head = f"Action {action}: the decisive current paragraph {cites} determines this outcome. "
-    body = re.sub(r"\s+", " ", str(model_text or "")).strip()
-    text = head + body
+    text = f"Action {action}. Decisive evidence {cites}: " + re.sub(r"\s+", " ", str(extra or "")).strip()
     if len(text) < 60:
-        text += " Other references in the package are cover-sheet, archived, or decoy material."
+        text += " Cover-sheet, archive and training references were excluded."
     return text[:1500]
 
 
-def validate_decision(pkg, raw):
-    """Return (decision, problem). decision is None when not repairable."""
-    if not isinstance(raw, dict):
-        return None, "missing decision"
-    action = raw.get("action")
-    if action not in ACTIONS:
-        return None, f"invalid action {action!r}"
+def validate_full(pkg, raw):
+    """Validate a full-document LLM decision (unexpected layouts)."""
+    if not isinstance(raw, dict) or raw.get("action") not in ACTIONS:
+        return None
     ref_paras, para_refs = ref_index(pkg)
-    model_refs = [norm_ref(r) for r in (raw.get("evidenceRefs") or []) if isinstance(r, (str, int))]
-    valid = [r for r in model_refs if r in ref_paras]
+    valid = [r for r in (norm_ref(x) for x in raw.get("evidenceRefs") or []) if r in ref_paras]
     refs = None
-    if len(valid) == 3 and len(set(valid)) == 3:
-        common = set.intersection(*(ref_paras[r] for r in valid))
-        if common:
-            refs = valid
-    if refs is None and valid:
-        # Repair: pick the paragraph holding most of the model's refs that has exactly 3 refs.
-        scores = {}
-        for r in valid:
-            for i in ref_paras[r]:
-                scores[i] = scores.get(i, 0) + 1
-        for i, _ in sorted(scores.items(), key=lambda kv: -kv[1]):
+    if len(valid) == 3 and set.intersection(*(ref_paras[r] for r in valid)):
+        refs = valid
+    elif valid:
+        for i in sorted({i for r in valid for i in ref_paras[r]}):
             if len(para_refs[i]) == 3:
                 refs = para_refs[i]
                 break
-    if refs is None:
-        return None, f"evidenceRefs {model_refs} are not three refs from one paragraph"
     f = raw.get("facts") or {}
     try:
         facts = {"vendorName": str(f.get("vendorName", "")).strip(),
@@ -336,114 +374,110 @@ def validate_decision(pkg, raw):
                  "amountMinor": to_int_minor(f.get("amountMinor")),
                  "currency": str(f.get("currency", "")).strip().upper()}
     except Exception:
-        return None, "amountMinor must be an integer in minor units"
-    if not facts["vendorName"] or not facts["invoiceNumber"] or not re.fullmatch(r"[A-Z]{3}", facts["currency"]):
-        return None, "facts incomplete"
-    return {"action": action, "facts": facts, "evidenceRefs": refs,
-            "rationale": build_rationale(action, refs, raw.get("rationale"))}, None
+        return None
+    if not refs or not facts["vendorName"] or not facts["invoiceNumber"]:
+        return None
+    return {"action": raw["action"], "facts": facts, "evidenceRefs": refs,
+            "rationale": build_rationale(raw["action"], refs, raw.get("reason"))}
 
 
-def mock_decide(pkgs):
-    out = []
-    for pkg in pkgs:
-        _, para_refs = ref_index(pkg)
-        refs = next((r for r in para_refs if len(r) == 3), [])
-        f = pkg.get("invoice") or {}
-        out.append({"packageId": pkg["packageId"], "action": "hold_invoice", "evidenceRefs": refs,
-                    "facts": {"vendorName": f.get("vendorName", "Mock Vendor"),
-                              "invoiceNumber": f.get("invoiceNumber", "INV-0"),
-                              "amountMinor": f.get("amountMinor", 100), "currency": f.get("currency", "INR")},
-                    "rationale": "Mock decision for protocol testing."})
-    return {"decisions": out}
-
-
-async def llm_call(pkgs, policy_rev, note, timeout):
+async def llm_call(items, policy_rev, timeout):
     STATS["model_calls"] += 1
     if LLM_MOCK:
-        await asyncio.sleep(0.3)
-        return mock_decide(pkgs)
-    user = (f"Policy revision: {policy_rev}\n" + (f"\nCORRECTION NEEDED: {note}\n" if note else "")
-            + "\nInvoice packages (JSON):\n" + json.dumps(pkgs, ensure_ascii=False))
-    payload = {"model": LLM_MODEL, "temperature": 0,
-               "response_format": {"type": "json_object"},
+        await asyncio.sleep(0.2)
+        return {"decisions": [{"packageId": it["packageId"],
+                               "action": rule_action(it.get("decisiveParagraph", ""), None) or "open_exception",
+                               "reason": "mock"} for it in items]}
+    user = f"Policy revision: {policy_rev}\nItems:\n" + json.dumps(items, ensure_ascii=False)
+    payload = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": user}]}
     async with httpx.AsyncClient(timeout=timeout) as c:
         r = await c.post(f"{LLM_BASE_URL}/chat/completions", json=payload,
                          headers={"Authorization": f"Bearer {LLM_API_KEY}"})
-        r.raise_for_status()
+        if r.status_code >= 400:
+            STATS["last_llm_error"] = f"HTTP {r.status_code}: {r.text[:500]}"
+            r.raise_for_status()
         text = r.json()["choices"][0]["message"]["content"]
     text = re.sub(r"^```(?:json)?|```$", "", text.strip()).strip()
     return json.loads(text)
 
 
-async def decide_chunk(pkgs, policy_rev, note, timeout):
+async def llm_batch(items, policy_rev, timeout):
     try:
-        data = await llm_call(pkgs, policy_rev, note, timeout)
-        items = data.get("decisions", []) if isinstance(data, dict) else []
-        return {str(d.get("packageId")): d for d in items if isinstance(d, dict)}
+        data = await llm_call(items, policy_rev, timeout)
+        return {str(d.get("packageId")): d for d in data.get("decisions", []) if isinstance(d, dict)}
     except Exception as e:
-        print(f"[llm] chunk failed: {type(e).__name__}: {e}", flush=True)
+        STATS.setdefault("last_llm_error", f"{type(e).__name__}: {e}")
+        print(f"[llm] failed: {type(e).__name__}: {e} | {STATS.get('last_llm_error')}", flush=True)
         return {}
 
 
 async def decide(packages, policy_rev):
     """Return {packageId: decision}. Cached by canonical package content."""
     t0 = time.monotonic()
-    out, todo = {}, []
+    out, todo, info = {}, [], {}
     for pkg in packages:
         d = store.get_decision(cache_key(pkg, policy_rev))
         if d:
             out[pkg["packageId"]] = d
         else:
             todo.append(pkg)
-    attempt, problems, last_raw = 0, {}, {}
-    while todo and attempt < 2:
+            info[pkg["packageId"]] = analyze(pkg)
+    if not todo:
+        return out
+
+    items = []
+    for pkg in todo:
+        a = info[pkg["packageId"]]
+        if a["paragraph"] and a["facts"]:
+            items.append({"packageId": pkg["packageId"],
+                          "statedTotal": f'{a["facts"]["currency"]} {a["facts"]["amountMinor"] / 100:.2f}',
+                          "decisiveParagraph": a["paragraph"]})
+        else:
+            items.append({"packageId": pkg["packageId"], "documents": strip_ids(pkg)})
+
+    llm = {}
+    for attempt in range(2):
         remaining = DECIDE_BUDGET_S - (time.monotonic() - t0)
-        if remaining < 6:
+        missing = [it for it in items if it["packageId"] not in llm]
+        if not missing or remaining < 5:
             break
-        note = None
-        if attempt and problems:
-            note = "; ".join(f"package {k}: {v}" for k, v in problems.items())
-        chunks = [todo[i:i + CHUNK_SIZE] for i in range(0, len(todo), CHUNK_SIZE)]
-        results = await asyncio.gather(*[decide_chunk(c, policy_rev, note, remaining - 2) for c in chunks])
-        merged = {k: v for r in results for k, v in r.items()}
-        nxt, problems = [], {}
-        for pkg in todo:
-            pid = pkg["packageId"]
-            raw = merged.get(pid)
-            if raw:
-                last_raw[pid] = raw
-            d, prob = validate_decision(pkg, raw)
+        chunks = [missing[i:i + CHUNK_SIZE] for i in range(0, len(missing), CHUNK_SIZE)]
+        for r in await asyncio.gather(*[llm_batch(c, policy_rev, remaining - 2) for c in chunks]):
+            llm.update(r)
+
+    for pkg in todo:
+        pid = pkg["packageId"]
+        a = info[pid]
+        raw = llm.get(pid) or {}
+        model_action = raw.get("action") if raw.get("action") in ACTIONS else None
+        if a["paragraph"] and a["facts"]:
+            rule = rule_action(a["paragraph"], a["facts"])
+            if model_action and rule and model_action != rule:
+                print(f"[decide] {pid}: model={model_action} rule={rule}", flush=True)
+            action = model_action or rule
+            # Safety: never settle when the rules see a reason not to; trust exact
+            # authority arithmetic over the model for approve-vs-settle.
+            if rule and (action == "settle_invoice" or {action, rule} == {"settle_invoice", "request_approval"}):
+                action = rule
+            if action is None:
+                action = "open_exception"
+            d = {"action": action, "facts": a["facts"], "evidenceRefs": a["refs"],
+                 "rationale": build_rationale(action, a["refs"], a["paragraph"])}
+            if model_action or rule:
+                store.put_decision(cache_key(pkg, policy_rev), d)
+        else:
+            d = validate_full(pkg, raw)
             if d:
-                out[pid] = d
                 store.put_decision(cache_key(pkg, policy_rev), d)
             else:
-                problems[pid] = prob
-                nxt.append(pkg)
-        todo, attempt = nxt, attempt + 1
-    for pkg in todo:  # best-effort fallback: never settle an unverified package
-        pid = pkg["packageId"]
-        print(f"[decide] fallback for {pid}: {problems.get(pid)}", flush=True)
-        raw = dict(last_raw.get(pid) or {})
-        if raw.get("action") not in ACTIONS or raw.get("action") == "settle_invoice":
-            raw["action"] = "open_exception"
-        _, para_refs = ref_index(pkg)
-        if not raw.get("evidenceRefs"):
-            raw["evidenceRefs"] = next((r for r in para_refs if len(r) == 3), [])
-        d, _ = validate_decision(pkg, raw)
-        if d is None:
-            refs = [norm_ref(r) for r in raw.get("evidenceRefs", [])][:3]
-            facts = raw.get("facts") or {}
-            try:
-                amt = to_int_minor(facts.get("amountMinor"))
-            except Exception:
-                amt = 0
-            d = {"action": raw["action"], "evidenceRefs": refs,
-                 "facts": {"vendorName": str(facts.get("vendorName") or "unknown"),
-                           "invoiceNumber": str(facts.get("invoiceNumber") or "unknown"),
-                           "amountMinor": amt, "currency": str(facts.get("currency") or "INR").upper()[:3]},
-                 "rationale": build_rationale(raw["action"], refs, raw.get("rationale"))}
+                print(f"[decide] fallback for {pid}", flush=True)
+                refs = a["refs"] or next((r for r in ref_index(pkg)[1] if len(r) == 3), [])
+                facts = a["facts"] or {"vendorName": "unknown", "invoiceNumber": "unknown",
+                                       "amountMinor": 0, "currency": "INR"}
+                d = {"action": "open_exception", "facts": facts, "evidenceRefs": refs,
+                     "rationale": build_rationale("open_exception", refs, "Layout not recognised.")}
         out[pid] = d
     return out
 
@@ -710,11 +744,29 @@ app.add_api_route(BASE_PATH + "/tasks/", _list, methods=["GET"])
 @app.get("/_admin/recent")
 async def admin_recent(request: Request, n: int = 5):
     """Debug view of recent tasks (incl. raw packages). Disabled unless ADMIN_TOKEN is set."""
-    if not ADMIN_TOKEN or request.headers.get("x-admin-token") != ADMIN_TOKEN:
+    if not ADMIN_TOKEN or request.headers.get("x-admin-token", request.query_params.get("token")) != ADMIN_TOKEN:
         return err(404, "NOT_FOUND", "Not found")
     with store.lock:
         rows = store.db.execute("SELECT task_json FROM tasks ORDER BY created DESC LIMIT ?", (n,)).fetchall()
     return JSONResponse({"stats": STATS, "tasks": [json.loads(r[0]) for r in rows]})
+
+
+@app.get("/_admin/llmtest")
+async def admin_llmtest(request: Request):
+    """Makes one tiny model call and shows the raw result or error."""
+    if not ADMIN_TOKEN or request.headers.get("x-admin-token", request.query_params.get("token")) != ADMIN_TOKEN:
+        return err(404, "NOT_FOUND", "Not found")
+    payload = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
+               "messages": [{"role": "user", "content": 'Reply with JSON {"ok": true}'}]}
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(f"{LLM_BASE_URL}/chat/completions", json=payload,
+                             headers={"Authorization": f"Bearer {LLM_API_KEY}"})
+        return JSONResponse({"base": LLM_BASE_URL, "model": LLM_MODEL, "key_len": len(LLM_API_KEY),
+                             "status": r.status_code, "body": r.text[:800]})
+    except Exception as e:
+        return JSONResponse({"base": LLM_BASE_URL, "model": LLM_MODEL, "key_len": len(LLM_API_KEY),
+                             "error": f"{type(e).__name__}: {e}"})
 
 
 # Collapse accidental double slashes (e.g. base "/a2a/" + "/message:send") without redirecting.

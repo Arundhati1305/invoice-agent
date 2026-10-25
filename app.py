@@ -6,10 +6,14 @@ Layers:
   storage   - SQLite: tasks, message idempotency records, decision cache
   decision  - batched LLM call + strict validation/repair of every proposal
 
+GET /healthz is a cheap liveness probe (no DB, no model). On Render, a background
+task pings it every 10 minutes so the free-tier instance never goes to sleep.
+
 Run with ONE worker (in-process locks guard races):
   uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 """
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -43,6 +47,13 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DECIDE_BUDGET_S = float(os.environ.get("DECIDE_BUDGET_S", "38"))
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "")  # e.g. "none" for Gemini thinking models
 LLM_HTTP_TIMEOUT_MIN = float(os.environ.get("LLM_HTTP_TIMEOUT_MIN", "30"))
+
+# Keep-alive (Render free tier sleeps after ~15 min without inbound traffic).
+# Render sets RENDER_EXTERNAL_URL automatically; locally it is absent, so pinging stays off.
+_render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", f"{_render_url}/healthz" if _render_url else "")
+KEEPALIVE_MINUTES = 10  # ping every 10 minutes (Render sleeps after 15 minutes idle)
+KEEPALIVE_INTERVAL = KEEPALIVE_MINUTES * 60  # seconds
 
 MT_A2A = "application/a2a+json"
 MT_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
@@ -523,9 +534,41 @@ def public_proposal(p):
 
 
 # ----------------------------------------------------------------------------
+# Keep-alive (Render free tier)
+# ----------------------------------------------------------------------------
+async def keepalive_loop():
+    """Ping our own public URL every 10 minutes so Render never idles the service."""
+    await asyncio.sleep(30)  # let the server finish booting
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                r = await client.get(KEEPALIVE_URL, headers={"User-Agent": "a2a-keepalive"})
+                if r.status_code >= 400:
+                    print(f"[keepalive] ping returned HTTP {r.status_code}", flush=True)
+            except Exception as e:  # never let a failed ping kill the loop
+                print(f"[keepalive] ping failed: {type(e).__name__}", flush=True)
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    task = None
+    if KEEPALIVE_URL:
+        task = asyncio.create_task(keepalive_loop())
+        print(f"[keepalive] enabled: every {KEEPALIVE_MINUTES} min -> {KEEPALIVE_URL}", flush=True)
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+# ----------------------------------------------------------------------------
 # Routes
 # ----------------------------------------------------------------------------
-app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
 
 def agent_card():
@@ -557,6 +600,12 @@ async def card():
 
 @app.get("/")
 async def root():
+    return JSONResponse({"ok": True})
+
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+async def healthz():
+    # cheap liveness probe: no DB, no model call
     return JSONResponse({"ok": True})
 
 

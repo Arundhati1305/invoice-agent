@@ -321,24 +321,41 @@ def analyze(pkg):
 def rule_action(para, facts):
     """Keyword/arithmetic classifier. Returns an action or None when unsure."""
     t = para.lower()
-    if re.search(r"different (signed )?commercial invoice|not a duplicate|no payment was made for this", t) \
-            and not re.search(r"would be a duplicate|reject it", t):
-        return "settle_invoice"
-    if re.search(r"would be a duplicate|reject it|prior payment for the same (signed )?commercial invoice|already (been )?paid", t):
+
+    # DUPLICATE vs SETTLE  (test duplicate first; "commercial" is optional)
+    if re.search(r"would be a duplicate|reject it|same (signed )?(commercial )?invoice|"
+                 r"prior payment for the same|already (been )?paid", t) \
+            and not re.search(r"different (signed )?(commercial )?invoice|not a duplicate|"
+                              r"no payment was made for this", t):
         return "reject_duplicate"
-    if re.search(r"callback|until .{0,60}(clos|complet|confirm|verif|clear)|forbids remittance|pending verification|verification (is )?pending", t):
+    if re.search(r"different (signed )?(commercial )?invoice|not a duplicate|"
+                 r"no payment was made for this|can be settled", t):
+        return "settle_invoice"
+
+    # HOLD
+    if re.search(r"callback|until .{0,60}(clos|complet|confirm|verif|clear)|forbids remittance|"
+                 r"pending verification|verification (is )?pending", t):
         return "hold_invoice"
+
+    # EXCEPTION
     if re.search(r"exception workflow|does not reconcile|incompatible|conflicting records|irreconcil", t):
         return "open_exception"
-    if re.search(r"authority|approver|approval workflow|without escalation|delegat", t):
+
+    # APPROVAL vs SETTLE by exact arithmetic
+    has_auth = re.search(r"authority|approver|approval workflow|without escalation|delegat", t)
+    has_limit_cmp = re.search(r"(queue |approval |spend |autonomous )?limit", t) and \
+                    re.search(r"total|amount", t)
+    if has_auth or has_limit_cmp:
         limit = None
-        m = re.search(r"(?:up to|limit of|authority of)\s*([A-Z]{3})?\s*([\d,]+(?:\.\d+)?)", para) or \
-            re.search(r"([A-Z]{3})\s*([\d,]+(?:\.\d+)?)\s*authority", para)
+        m = (re.search(r"(?:up to|limit of|authority of)\s*([A-Z]{3})?\s*([\d,]+(?:\.\d+)?)", para)
+             or re.search(r"([A-Z]{3})\s*([\d,]+(?:\.\d+)?)\s*authority", para)
+             or re.search(r"limit\s*(?:is|of|:)?\s*([A-Z]{3})?\s*([\d,]+(?:\.\d+)?)", para, re.I))
         if m:
             limit = money_minor(m.group(2))
         if facts and limit is not None:
             return "request_approval" if facts["amountMinor"] > limit else "settle_invoice"
-        if re.search(r"outside|exceed|above|larger|requires the financial-approval|named approver", t):
+        if re.search(r"outside|exceed|above|larger|below .{0,30}total|"
+                     r"requires the financial-approval|named approver", t):
             return "request_approval"
         if re.search(r"within", t):
             return "settle_invoice"

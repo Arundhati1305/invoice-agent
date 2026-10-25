@@ -41,6 +41,8 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "12"))    # items per LLM call (pa
 REF_FORMAT = os.environ.get("REF_FORMAT", "inner")       # "inner" -> ABC-1, "bracketed" -> [ABC-1]
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DECIDE_BUDGET_S = float(os.environ.get("DECIDE_BUDGET_S", "38"))
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "")  # e.g. "none" for Gemini thinking models
+LLM_HTTP_TIMEOUT_MIN = float(os.environ.get("LLM_HTTP_TIMEOUT_MIN", "30"))
 
 MT_A2A = "application/a2a+json"
 MT_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
@@ -409,7 +411,12 @@ async def llm_call(items, policy_rev, timeout):
     payload = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                             {"role": "user", "content": user}]}
-    async with httpx.AsyncClient(timeout=timeout) as c:
+    # Gemini thinking models stall for 30s+ unless reasoning is turned off; harmless to others.
+    if LLM_REASONING_EFFORT:
+        payload["reasoning_effort"] = LLM_REASONING_EFFORT
+    # Give a slow model room, but never exceed the per-request budget passed in.
+    http_timeout = max(float(timeout), LLM_HTTP_TIMEOUT_MIN)
+    async with httpx.AsyncClient(timeout=http_timeout) as c:
         r = await c.post(f"{LLM_BASE_URL}/chat/completions", json=payload,
                          headers={"Authorization": f"Bearer {LLM_API_KEY}"})
         if r.status_code >= 400:
@@ -775,8 +782,10 @@ async def admin_llmtest(request: Request):
         return err(404, "NOT_FOUND", "Not found")
     payload = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                "messages": [{"role": "user", "content": 'Reply with JSON {"ok": true}'}]}
+    if LLM_REASONING_EFFORT:
+        payload["reasoning_effort"] = LLM_REASONING_EFFORT
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
+        async with httpx.AsyncClient(timeout=max(30.0, LLM_HTTP_TIMEOUT_MIN)) as c:
             r = await c.post(f"{LLM_BASE_URL}/chat/completions", json=payload,
                              headers={"Authorization": f"Bearer {LLM_API_KEY}"})
         return JSONResponse({"base": LLM_BASE_URL, "model": LLM_MODEL, "key_len": len(LLM_API_KEY),

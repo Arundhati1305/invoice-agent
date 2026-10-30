@@ -233,7 +233,7 @@ SYSTEM_PROMPT = """You are an accounts-payable control agent. For each item, rea
 - open_exception: material records conflict (price/quantity/valuation/contract disagreements) and need the exception workflow.
 
 Watch for negation ("No ... discrepancy remains", "not a duplicate") and for amounts: compare the stated total with any authority limit.
-If an item has "documents" instead of a decisive paragraph, find the decisive paragraph yourself: it is the current statement about this invoice with exactly three bracketed references; ignore the cover sheet, archive notes, training material, hypothetical examples and superseded drafts. Then also return its three references (text inside the brackets) and the invoice facts.
+If an item has "documents" instead of a decisive paragraph, the evidence may be spread over several one-reference lines in different documents. Use only lines about THIS invoice's current order: the signed order/instrument and receipt figures, the payment-ledger line, and the vendor/bank/payment-ceiling controls. Ignore archive notes, training cases, hypothetical examples, expired thresholds, unrelated orders and other suppliers. Decide with these rules in order: the ledger already settled the SAME order -> reject_duplicate (a payment for a DIFFERENT order is not a duplicate); signed order and invoice amounts materially differ -> open_exception; bank instructions changed and the callback is not confirmed -> hold_invoice; total above the autonomous payment ceiling -> request_approval; otherwise settle_invoice. Return the bracketed references (text inside the brackets) of the lines that establish the action, and the invoice facts (vendorName = the payee/supplier, invoiceNumber = the INV-... identifier if one is given, otherwise the current order number).
 
 Return ONLY JSON:
 {"decisions":[{"packageId":"...","action":"<one action>","reason":"one short sentence",
@@ -375,6 +375,84 @@ def rule_action(para, facts):
     return None
 
 
+SPLIT_NOISE_RE = re.compile(r"archive|archived|training|unrelated|hypothetical|expired|separate supplier|"
+                            r"govern no live case|different order contains|previous quarter|not this vendor|"
+                            r"superseded|for example", re.I)
+
+
+def _amt(cur, num):
+    return cur.upper(), money_minor(num)
+
+
+def analyze_split(pkg):
+    """Deterministic read of packages whose evidence is spread over one-reference lines."""
+    lines = []
+    for p in paragraphs_of(strip_ids(pkg)):
+        refs = refs_in(p)
+        if len(refs) == 1 and not SPLIT_NOISE_RE.search(p):
+            lines.append((refs[0], p))
+    out = {"refs": [r for r, _ in lines], "lines": dict(lines), "action": None, "reason": None, "facts": None}
+    text = "\n".join(p for _, p in lines)
+    order = invoice = vendor = None
+    signed = billed = None
+    m = re.search(r"Signed commercial instrument\s+(INV-[\w-]+)\s+covers order\s+(PO-[\w-]+),.*?\b([A-Z]{3})\s*([\d,]+\.\d+)", text)
+    if m:
+        invoice, order = m.group(1), m.group(2)
+        signed = billed = _amt(m.group(3), m.group(4))
+    m = re.search(r"Order\s+(PO-[\w-]+)\s+is signed for\s+([A-Z]{3})\s*([\d,]+\.\d+).*?invoice total is\s+([A-Z]{3})\s*([\d,]+\.\d+)", text, re.S)
+    if m:
+        order = order or m.group(1)
+        signed, billed = _amt(m.group(2), m.group(3)), _amt(m.group(4), m.group(5))
+    m = re.search(r"(INV-[\w-]+)", text)
+    if m and not invoice:
+        invoice = m.group(1)
+    led = re.search(r"disbursement for\s+([A-Z]{3})\s*([\d,]+\.\d+)\s+to\s+(.+?)\s+previously settled order\s+(PO-[\w-]+)\.\s*"
+                    r"The currently submitted order is\s+(PO-[\w-]+)", text)
+    if led:
+        vendor = led.group(3).strip()
+        order = order or led.group(5)
+        if billed is None:
+            billed = _amt(led.group(1), led.group(2))
+    if billed:
+        out["facts"] = {"vendorName": vendor or "", "invoiceNumber": invoice or order or "",
+                        "amountMinor": billed[1], "currency": billed[0]}
+    # rules, in the order the payment controls state them
+    if led and led.group(4) == led.group(5):
+        out["action"], out["reason"] = "reject_duplicate", (
+            f"The payment ledger shows order {led.group(4)} was already settled, and the submitted claim is for the same "
+            f"order, so paying it again would discharge the same commercial order twice.")
+        return out
+    if signed and billed and signed != billed or re.search(r"does not (match|reconcile)|discrepan|mismatch", text, re.I):
+        if not re.search(r"no (material )?discrepan", text, re.I):
+            out["action"], out["reason"] = "open_exception", (
+                "The signed order and the submitted invoice do not agree, and a material order/invoice difference "
+                "requires the exception process.")
+            return out
+    bank = re.search(r"Vendor master lists account\s+([\w-]+)\.\s*Remittance instructions now specify\s+([\w-]+)", text)
+    confirmed = re.search(r"callback[^.]*\b(is|was|has been)\s+confirmed", text, re.I) and \
+        not re.search(r"not (yet )?(been )?confirmed|pending|outstanding|awaiting", text, re.I)
+    if bank and bank.group(1) != bank.group(2) and not confirmed:
+        out["action"], out["reason"] = "hold_invoice", (
+            f"Remittance instructions changed from {bank.group(1)} to {bank.group(2)} and the callback is not confirmed, "
+            "so payment pauses until the bank change is verified.")
+        return out
+    ceil = re.search(r"ceiling for\s+[A-Z]{3}\s+is\s+([A-Z]{3})\s*([\d,]+\.\d+)", text)
+    if ceil and billed:
+        limit = money_minor(ceil.group(2))
+        total = f"{billed[0]} {billed[1] / 100:.2f}"
+        if billed[1] > limit:
+            out["action"], out["reason"] = "request_approval", (
+                f"The claim is otherwise payable, but its total {total} exceeds the autonomous payment ceiling "
+                f"{ceil.group(1)} {ceil.group(2)}, so a named approver is required.")
+        else:
+            prior = (f" The ledger payment was for a different order ({led.group(4)}), so this is not a duplicate."
+                     if led else "")
+            out["action"], out["reason"] = "settle_invoice", (
+                f"The signed order, receiving entry and invoice agree at {total}, the bank details are verified, and the "
+                f"total is within the autonomous payment ceiling {ceil.group(1)} {ceil.group(2)}.{prior}")
+    return out
+
+
 def build_rationale(action, refs, extra):
     cites = ", ".join(f"[{r}]" for r in refs)
     text = f"Action {action}. Decisive evidence {cites}: " + re.sub(r"\s+", " ", str(extra or "")).strip()
@@ -389,8 +467,11 @@ def validate_full(pkg, raw):
         return None
     ref_paras, para_refs = ref_index(pkg)
     valid = [r for r in (norm_ref(x) for x in raw.get("evidenceRefs") or []) if r in ref_paras]
+    valid = list(dict.fromkeys(valid))
     refs = None
     if len(valid) == 3 and set.intersection(*(ref_paras[r] for r in valid)):
+        refs = valid
+    elif 2 <= len(valid) <= 4:
         refs = valid
     elif valid:
         for i in sorted({i for r in valid for i in ref_paras[r]}):
@@ -503,8 +584,24 @@ async def decide(packages, policy_rev):
             if model_action or rule:
                 store.put_decision(cache_key(pkg, policy_rev), d)
         else:
+            sp = analyze_split(pkg)
             d = validate_full(pkg, raw)
-            if d:
+            if sp["facts"] and 2 <= len(sp["refs"]) <= 4 and (sp["action"] or model_action):
+                rule = sp["action"]
+                if model_action and rule and model_action != rule:
+                    print(f"[decide] {pid} (split): model={model_action} rule={rule}", flush=True)
+                action = rule or model_action  # explicit payment-control arithmetic wins on this layout
+                facts = dict(sp["facts"])
+                mf = (d or {}).get("facts") or {}
+                for k in ("vendorName", "invoiceNumber"):
+                    if not facts.get(k) and mf.get(k):
+                        facts[k] = mf[k]
+                reason = sp["reason"] if action == rule and sp["reason"] else (raw.get("reason") or "")
+                cites = " ".join(f"[{r}] {re.sub(chr(92)+'s+', ' ', sp['lines'][r])[:220]}" for r in sp["refs"])
+                d = {"action": action, "facts": facts, "evidenceRefs": sp["refs"],
+                     "rationale": build_rationale(action, sp["refs"], reason + " Evidence: " + cites)}
+                store.put_decision(cache_key(pkg, policy_rev), d)
+            elif d:
                 store.put_decision(cache_key(pkg, policy_rev), d)
             else:
                 print(f"[decide] fallback for {pid}", flush=True)
